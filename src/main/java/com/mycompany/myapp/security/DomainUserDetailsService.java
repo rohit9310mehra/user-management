@@ -1,10 +1,16 @@
 package com.mycompany.myapp.security;
 
+import static com.mycompany.myapp.database.Tables.*;
+
+import com.mycompany.myapp.database.Tables;
+import com.mycompany.myapp.database.tables.records.JhiUserRecord;
 import com.mycompany.myapp.domain.Authority;
 import com.mycompany.myapp.domain.User;
 import com.mycompany.myapp.repository.UserRepository;
 import java.util.*;
+import java.util.stream.Collectors;
 import org.hibernate.validator.internal.constraintvalidators.hv.EmailValidator;
+import org.jooq.DSLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
@@ -20,43 +26,66 @@ import org.springframework.transaction.annotation.Transactional;
 @Component("userDetailsService")
 public class DomainUserDetailsService implements UserDetailsService {
 
-    private static final Logger LOG = LoggerFactory.getLogger(DomainUserDetailsService.class);
+    private final DSLContext dsl;
+    private final Logger log = LoggerFactory.getLogger(DomainUserDetailsService.class);
 
-    private final UserRepository userRepository;
-
-    public DomainUserDetailsService(UserRepository userRepository) {
-        this.userRepository = userRepository;
+    public DomainUserDetailsService(DSLContext dsl) {
+        this.dsl = dsl;
     }
 
     @Override
-    @Transactional(readOnly = true)
-    public UserDetails loadUserByUsername(final String login) {
-        LOG.debug("Authenticating {}", login);
+    public UserDetails loadUserByUsername(final String login) throws UsernameNotFoundException {
+        log.debug("Authenticating {}", login);
 
-        if (new EmailValidator().isValid(login, null)) {
-            return userRepository
-                .findOneWithAuthoritiesByEmailIgnoreCase(login)
-                .map(user -> createSpringSecurityUser(login, user))
-                .orElseThrow(() -> new UsernameNotFoundException("User with email " + login + " was not found in the database"));
+        //        Record userRecord;
+        JhiUserRecord userRecord;
+        boolean isEmail = new EmailValidator().isValid(login, null);
+
+        if (isEmail) {
+            userRecord = (JhiUserRecord) dsl
+                .select()
+                .from(JHI_USER)
+                //                .leftJoin(JHI_USER_AUTHORITY).on(JHI_USER.ID.eq(JHI_USER_AUTHORITY.USER_ID))
+                //                .leftJoin(JHI_AUTHORITY).on(JHI_USER_AUTHORITY.AUTHORITY_NAME.eq(JHI_AUTHORITY.NAME))
+                .where(JHI_USER.EMAIL.eq(login.toLowerCase()))
+                .fetchOne();
+        } else {
+            userRecord = (JhiUserRecord) dsl
+                .select()
+                .from(JHI_USER)
+                //                .leftJoin(JHI_USER_AUTHORITY).on(JHI_USER.ID.eq(JHI_USER_AUTHORITY.USER_ID))
+                //                .leftJoin(JHI_AUTHORITY).on(JHI_USER_AUTHORITY.AUTHORITY_NAME.eq(JHI_AUTHORITY.NAME))
+                .where(JHI_USER.LOGIN.eq(login.toLowerCase()))
+                .fetchOne();
         }
 
-        String lowercaseLogin = login.toLowerCase(Locale.ENGLISH);
-        return userRepository
-            .findOneWithAuthoritiesByLogin(lowercaseLogin)
-            .map(user -> createSpringSecurityUser(lowercaseLogin, user))
-            .orElseThrow(() -> new UsernameNotFoundException("User " + lowercaseLogin + " was not found in the database"));
+        if (userRecord == null) {
+            throw new UsernameNotFoundException("User " + login + " not found in the database");
+        }
+
+        return createSpringSecurityUser(userRecord);
     }
 
-    private org.springframework.security.core.userdetails.User createSpringSecurityUser(String lowercaseLogin, User user) {
-        if (!user.isActivated()) {
-            throw new UserNotActivatedException("User " + lowercaseLogin + " was not activated");
+    private UserDetails createSpringSecurityUser(JhiUserRecord userRecord) {
+        String login = userRecord.get(JHI_USER.LOGIN);
+        String password = userRecord.get(JHI_USER.PASSWORD_HASH);
+        byte activated = userRecord.get(JHI_USER.ACTIVATED);
+
+        if (activated != 1) {
+            throw new UserNotActivatedException("User " + login + " was not activated");
         }
-        List<SimpleGrantedAuthority> grantedAuthorities = user
-            .getAuthorities()
+
+        List<SimpleGrantedAuthority> authorities = dsl
+            .select(JHI_AUTHORITY.NAME)
+            .from(JHI_AUTHORITY)
+            .join(JHI_USER_AUTHORITY)
+            .on(JHI_USER_AUTHORITY.AUTHORITY_NAME.eq(JHI_AUTHORITY.NAME))
+            .where(JHI_USER_AUTHORITY.USER_ID.eq(userRecord.get(JHI_USER.ID)))
+            .fetch()
             .stream()
-            .map(Authority::getName)
-            .map(SimpleGrantedAuthority::new)
-            .toList();
-        return new org.springframework.security.core.userdetails.User(user.getLogin(), user.getPassword(), grantedAuthorities);
+            .map(record -> new SimpleGrantedAuthority(record.get(JHI_AUTHORITY.NAME)))
+            .collect(Collectors.toList());
+
+        return new org.springframework.security.core.userdetails.User(login, password, authorities);
     }
 }
